@@ -1,0 +1,9 @@
+cd "/c/Users/"
+git init
+git remote add origin https://github.com/DiegoSanMo6011/Locomotion-for-soft-crwaling-robots.git
+git remote add origin https://github.com/DiegoSanMo6011/Locomotion-for-soft-crwaling-robots.git
+git add .
+git commit -m "Subiendo carpeta inicial del proyecto"
+git branch -M main
+git push -u origin main
+git push origin main
