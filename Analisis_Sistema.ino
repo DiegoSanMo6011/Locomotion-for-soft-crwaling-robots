@@ -1,0 +1,194 @@
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+
+Adafruit_ADS1115 ads;
+
+/* ---------- PINES ESP32 ---------- */
+const int SDA_PIN   = 21;
+const int SCL_PIN   = 22;
+const int pinPWM    = 18;   // pin PWM hacia la bomba
+
+/* ---------- CONFIG PWM ESP32 ---------- */
+const int PWM_CHANNEL    = 0;
+const int PWM_FREQ       = 1000;   // Hz  (recomendado: 100–1000 Hz para bomba DC)
+const int PWM_RESOLUTION = 8;     // 0–255
+
+int currentPWM = 0;
+
+/* ---------- SENSOR DE PRESIÓN ---------- */
+// Ajusta esto a TU sensor real (estos son ejemplos):
+const float V_OFFSET  = 2.5f;   // Voltaje a 0 kPa
+const float V_PER_kPa = 0.02f;  // Volts por kPa
+
+/* ---------- PARÁMETROS DEL EXPERIMENTO ---------- */
+
+// Muestreo
+const unsigned long SAMPLE_PERIOD_MS = 10;    // 10 ms (bueno para identificación de tau)
+
+// Barrido de PWM (ajusta a la zona que te interese)
+const int PWM_START = 0;       // PWM inicial
+const int PWM_END   = 255;     // PWM final
+const int PWM_STEP  = 5;       // tamaño del paso (ej. 5 o 10)
+
+// Duración de cada escalón (mín. ~5 tau; tau ~90ms → 5*tau ≈ 450ms)
+const unsigned long STEP_HOLD_MS = 5000;       // 5 s por escalón
+
+// Tiempo en reposo antes y después del barrido (para baseline)
+const unsigned long BASELINE_BEFORE_MS = 2000;  // 2 s en PWM=0 antes del barrido
+const unsigned long BASELINE_AFTER_MS  = 2000;  // 2 s en PWM=0 después del barrido
+
+/* ---------- MÁQUINA DE ESTADOS ---------- */
+enum State {
+  STATE_BASELINE_BEFORE,
+  STATE_SWEEP_UP,
+  //STATE_SWEEP_DOWN,   // si quisieras hacer también barrido de bajada
+  STATE_BASELINE_AFTER,
+  STATE_FINISHED
+};
+
+State state = STATE_BASELINE_BEFORE;
+
+unsigned long tExperiment0   = 0;    // tiempo de inicio del experimento
+unsigned long tLastSample    = 0;    // última muestra enviada
+unsigned long tStepChange    = 0;    // instante del último cambio de PWM
+
+int pwmValue = PWM_START;            // valor de PWM actual en el barrido
+
+
+/* ---------- FUNCIONES AUXILIARES ---------- */
+
+// Convertir lectura ADS1115 a presión en kPa
+float readPressurekPa() {
+  int16_t adc = ads.readADC_SingleEnded(0);    // canal A0
+  float volts = ads.computeVolts(adc);
+  float p_kPa = (volts - V_OFFSET) / V_PER_kPa;  // puede ser negativa (vacío)
+  return p_kPa;
+}
+
+// Escribir PWM en el canal del ESP32
+void setPWM(int value) {
+  if (value < 0)   value = 0;
+  if (value > 255) value = 255;
+  currentPWM = value;
+  ledcWrite(PWM_CHANNEL, currentPWM);
+}
+
+
+/* ========================= SETUP ========================= */
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);  // tiempo para abrir Serial si quieres
+
+  // I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // ADS1115
+  if (!ads.begin()) {
+    Serial.println("ERROR: No se encontró el ADS1115");
+    while (1) {
+      delay(1000);
+    }
+  }
+  ads.setGain(GAIN_ONE);  // ±4.096V, ajusta si tu sensor usa otro rango
+
+  // PWM ESP32
+  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(pinPWM, PWM_CHANNEL);
+
+  // Estado inicial
+  setPWM(0);
+  tExperiment0 = millis();
+  tLastSample  = tExperiment0;
+  tStepChange  = tExperiment0;
+
+  // Encabezado CSV
+  Serial.println("t_ms,PWM,Presion_kPa");
+}
+
+
+/* ========================= LOOP ========================= */
+
+void loop() {
+  unsigned long now = millis();
+
+  // 1) Enviar muestra periódicamente
+  if (now - tLastSample >= SAMPLE_PERIOD_MS) {
+    tLastSample = now;
+
+    float pres_kPa    = readPressurekPa();
+    unsigned long t_ms = now - tExperiment0;
+
+    Serial.print(t_ms);
+    Serial.print(",");
+    Serial.print(currentPWM);
+    Serial.print(",");
+    Serial.println(pres_kPa, 3);   // 3 decimales
+  }
+
+  // 2) Lógica de la máquina de estados
+  switch (state) {
+
+    case STATE_BASELINE_BEFORE:
+      // Mantener PWM=0 un tiempo inicial
+      setPWM(0);
+      if (now - tExperiment0 >= BASELINE_BEFORE_MS) {
+        // Pasar al primer escalón del barrido
+        pwmValue   = PWM_START;
+        setPWM(pwmValue);
+        tStepChange = now;
+        state = STATE_SWEEP_UP;
+      }
+      break;
+
+    case STATE_SWEEP_UP:
+      // Mantener cada escalón STEP_HOLD_MS y luego incrementar PWM
+      if (now - tStepChange >= STEP_HOLD_MS) {
+        pwmValue += PWM_STEP;
+        if (pwmValue > PWM_END) {
+          // Barrido hacia arriba terminado → ir a baseline final
+          setPWM(0);
+          tStepChange = now;
+          state = STATE_BASELINE_AFTER;
+        } else {
+          setPWM(pwmValue);
+          tStepChange = now;
+        }
+      }
+      break;
+
+    /*
+    // Si quisieras también un barrido descendente, podrías agregar algo así:
+
+    case STATE_SWEEP_DOWN:
+      if (now - tStepChange >= STEP_HOLD_MS) {
+        pwmValue -= PWM_STEP;
+        if (pwmValue < PWM_START) {
+          setPWM(0);
+          tStepChange = now;
+          state = STATE_BASELINE_AFTER;
+        } else {
+          setPWM(pwmValue);
+          tStepChange = now;
+        }
+      }
+      break;
+    */
+
+    case STATE_BASELINE_AFTER:
+      // Mantener PWM=0 un tiempo final
+      setPWM(0);
+      if (now - tStepChange >= BASELINE_AFTER_MS) {
+        state = STATE_FINISHED;
+      }
+      break;
+
+    case STATE_FINISHED:
+      // Experimento terminó. Puedes:
+      //  - dejar la bomba apagada y seguir mandando presión
+      //  - o hacer while(true) para congelar
+      setPWM(0);
+      while (1) { delay(1000); }  // si quieres detener totalmente
+      break;
+  }
+}
